@@ -12,7 +12,7 @@ from torch.nn.modules import module
 import torchvision
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets, transforms
-from deferred_model import DeferredNerf
+from dense_grid import DeferredNerf
 
 ti.init(arch=ti.cuda)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -30,7 +30,7 @@ image_h = 800.0 / downscale
 
 mlp_layers = 8
 mlp_hidden = 64
-learning_rate = 1e-3
+learning_rate = 1e-2
 iterations = 300000
 batch_size = 4096
 optimizer_fn = torch.optim.Adam

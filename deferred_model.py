@@ -104,6 +104,7 @@ class DeferredNerf(nn.Module):
     view_dir = torch.Tensor(size=(x.shape[0], 3)).to(device)
     dists = torch.Tensor(size=(samples, x.shape[0])).to(device)
 
+    ti.sync()
     gen_samples(x, pos_query, view_dir, dists, samples, batch_size)
     ti.sync()
     torch.cuda.synchronize(device=None)
