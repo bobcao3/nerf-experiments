@@ -1,9 +1,7 @@
-from random import sample
 import torch
 from torch import nn
 import torch.nn.functional as F
 import numpy as np
-import math
 
 import taichi as ti
 
@@ -11,9 +9,20 @@ from math_utils import ray_aabb_intersection
 
 device = 'cuda'
 
+L = 5
+max_scale = 2
+
+@ti.func
+def frequency_encoding(pos, freqs : ti.template(), sample, i):
+  for axis in ti.static(range(3)):
+    for l in range(L):
+      x = (2.0 ** (l - max_scale)) * np.pi * pos[axis]
+      freqs[sample, i, (axis * L + l) * 2] = ti.sin(x)
+      freqs[sample, i, (axis * L + l) * 2 + 1] = ti.cos(x)
+
 @ti.kernel
 def gen_samples(x : ti.types.ndarray(element_dim=1),
-                pos_query : ti.types.ndarray(element_dim=1),
+                pos_query : ti.types.ndarray(),
                 view_dirs : ti.types.ndarray(element_dim=1),
                 dists : ti.types.ndarray(),
                 n_samples : ti.i32, batch_size : ti.i32):
@@ -28,7 +37,8 @@ def gen_samples(x : ti.types.ndarray(element_dim=1),
     view_dirs[i] = -ray_dir
     for j in range(n_samples):
       d = near + (far - near) / ti.cast(n_samples, ti.f32) * (ti.cast(j, ti.f32) + ti.random())
-      pos_query[j, i] = ray_origin + ray_dir * d
+      pos = ray_origin + ray_dir * d
+      frequency_encoding(pos, pos_query, j, i)
       dists[j, i] = d
     for j in range(n_samples - 1):
       dists[j, i] = dists[j + 1, i] - dists[j, i]
@@ -38,7 +48,7 @@ class DeferredNerf(nn.Module):
   def __init__(self, num_layers, num_hidden):
     super(DeferredNerf, self).__init__()
     self.density_diffuse_feature_net = nn.Sequential(
-      nn.Linear(30, num_hidden),
+      nn.Linear(3 * L * 2, num_hidden),
       nn.ReLU(inplace=True),
       nn.Linear(num_hidden, num_hidden),
       nn.ReLU(inplace=True),
@@ -59,17 +69,8 @@ class DeferredNerf(nn.Module):
       nn.Sigmoid()
     )
 
-  def positional_encoding(self, pos_query):
-    L = 5
-    max_scale = 2
-    encoded = torch.Tensor(size=(pos_query.shape[0], 3, L * 2)).to(device)
-    for i in range(L):
-      encoded[:,:,i * 2] = torch.sin(np.exp2(i - max_scale) * math.pi * pos_query)
-      encoded[:,:,i * 2 + 1] = torch.cos(np.exp2(i - max_scale) * math.pi * pos_query)
-    return encoded.reshape((-1, 3 * L * 2))
-
   def query(self, pos_query):
-    pos_query = self.positional_encoding(pos_query.reshape((-1,3)))
+    pos_query = pos_query.reshape((-1, 3 * L * 2))
     density_feature = self.density_diffuse_feature_net(pos_query)
     density = density_feature[:,0]
     diffuse = torch.sigmoid(density_feature[:,1:4])
@@ -97,9 +98,9 @@ class DeferredNerf(nn.Module):
   def forward(self, x):
     # x [batch, (pos, dir)]
     batch_size = x.shape[0]
-    samples = 512
+    samples = 128
 
-    pos_query = torch.Tensor(size=(samples, x.shape[0], 3)).to(device)
+    pos_query = torch.Tensor(size=(samples, x.shape[0], 3 * L * 2)).to(device)
     view_dir = torch.Tensor(size=(x.shape[0], 3)).to(device)
     dists = torch.Tensor(size=(samples, x.shape[0])).to(device)
 

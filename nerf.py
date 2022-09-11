@@ -29,7 +29,7 @@ image_w = 800.0 / downscale
 image_h = 800.0 / downscale
 
 mlp_layers = 8
-mlp_hidden = 128
+mlp_hidden = 64
 learning_rate = 1e-3
 iterations = 300000
 batch_size = 4096
