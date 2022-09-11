@@ -2,14 +2,14 @@ import torch
 import open3d as o3d
 import numpy as np
 
-X = torch.vstack(torch.load("input_samples.th")).cpu()
-Y = torch.vstack(torch.load("output_samples.th")).cpu()
+X = (torch.load("input_samples.th")).cpu()
+Y = (torch.load("output_samples.th")).cpu()
 
 # view_samples = 10000
 
-non_zero_samples_r = Y[:,0].ge(0.5)
-non_zero_samples_g = Y[:,1].le(0.01)
-non_zero_samples_b = Y[:,2].le(0.01)
+non_zero_samples_r = Y[:,0].ge(0.01)
+non_zero_samples_g = Y[:,1].ge(0.01)
+non_zero_samples_b = Y[:,2].ge(0.01)
 non_zero_samples = non_zero_samples_r.logical_and(non_zero_samples_g).logical_and(non_zero_samples_b)
 
 print(non_zero_samples)
@@ -24,8 +24,8 @@ indicies = torch.randperm(X.shape[0])[:view_samples]
 Xp = X[indicies]
 Yp = Y[indicies]
 
-line_start = Xp[:,0:3] + Xp[:,3:] * 2.0
-line_end = Xp[:,0:3] + Xp[:,3:] * 6.0
+line_start = Xp[:,0:3] + Xp[:,3:] * 0.0
+line_end = Xp[:,0:3] + Xp[:,3:] * 2.0
 
 vertices = torch.cat((line_start, line_end), dim=0).detach().numpy()
 indicies = np.array(range(view_samples)).reshape((view_samples,1))

@@ -1,5 +1,7 @@
 *.pth
+*.th
 *.png
 nerf_synthetic/
 runs/
 .vscode
+__pycache__

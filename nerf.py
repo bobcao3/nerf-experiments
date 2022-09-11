@@ -12,9 +12,9 @@ from torch.nn.modules import module
 import torchvision
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import datasets, transforms
-from model import NerfMLP
+from deferred_model import DeferredNerf
 
-ti.init(arch=ti.vulkan)
+ti.init(arch=ti.cuda)
 torch.backends.cuda.matmul.allow_tf32 = True
 
 def loss_fn(X, Y):
@@ -30,7 +30,7 @@ image_h = 800.0 / downscale
 
 mlp_layers = 8
 mlp_hidden = 128
-learning_rate = 5e-4
+learning_rate = 1e-3
 iterations = 300000
 batch_size = 4096
 optimizer_fn = torch.optim.Adam
@@ -113,7 +113,7 @@ desc_test = load_desc_from_json(set_name + "/" + scene_name + "/transforms_test.
 
 device = "cuda"
 
-model = NerfMLP(num_layers=mlp_layers, num_hidden=mlp_hidden).to(device)
+model = DeferredNerf(num_layers=mlp_layers, num_hidden=mlp_hidden).to(device)
 print(model)
 
 optimizer = optimizer_fn(model.parameters(), lr=learning_rate)
@@ -156,8 +156,9 @@ for iter in range(iterations):
   Ybatch = Y[indices[b]]
 
   with torch.cuda.amp.autocast():
-    pred = model(Xbatch)
-    loss = loss_fn(pred, Ybatch)
+    pred, diffuse = model(Xbatch)
+    loss = loss_fn(pred, Ybatch) * 0.1
+    loss += loss_fn(diffuse, Ybatch)
   
   loss.backward()
   optimizer.step()
@@ -185,7 +186,7 @@ for iter in range(iterations):
 
         for b in range(len(Xbatch)):
           with torch.cuda.amp.autocast():
-            pred = model(Xbatch[b])
+            pred, _ = model(Xbatch[b])
             loss = loss_fn(pred, Ybatch[b])
             img_pred.append(pred)
             test_loss += loss.item()
