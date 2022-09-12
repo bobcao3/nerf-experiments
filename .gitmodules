@@ -1,0 +1,3 @@
+[submodule "msssim"]
+	path = msssim
+	url = https://github.com/VainF/pytorch-msssim
