@@ -1,10 +1,7 @@
-from sched import scheduler
-from statistics import mode
-from weakref import ref
 import taichi as ti
 import numpy as np
 
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 
 from taichi.math import ivec2, vec2
 # from msssim.pytorch_msssim import MS_SSIM
@@ -38,6 +35,14 @@ max_scale = 1
 def ti_update_weights(weight : ti.template(), grad : ti.template(), lr : ti.f32):
     for I in ti.grouped(weight):
         weight[I] -= lr * grad[I]
+
+@ti.kernel
+def ti_update_weights(weight : ti.template(), grad : ti.template(), grad_2nd_moments : ti.template(), lr : ti.f32, eps : ti.f32):
+    for I in ti.grouped(weight):
+        g = grad[I]
+        g2 = grad_2nd_moments[I] + g * g
+        grad_2nd_moments[I] = g2
+        weight[I] -= lr * g / (ti.sqrt(g2) + eps)
 
 @ti.data_oriented
 class FrequencyEncoding:
@@ -140,6 +145,7 @@ class MultiResHashEncoding:
     def __init__(self) -> None:
         self.input_positions = ti.Vector.field(2, dtype=ti.f32, shape=(BATCH_SIZE), needs_grad=False)
         self.grids = []
+        self.grids_2nd_moment = []
 
         self.N_max = max(width, height) // 2
         self.N_min = 16
@@ -163,6 +169,7 @@ class MultiResHashEncoding:
                 table_size = (N_l + 1) * (N_l + 1)
             print(f"level {i} resolution: {N_l} n_entries: {table_size}")
             self.grids.append(ti.Vector.field(2, dtype=ti.f32, shape=(table_size), needs_grad=True))
+            self.grids_2nd_moment.append(ti.Vector.field(2, dtype=ti.f32, shape=(table_size)))
             self.n_features += 2
             self.n_params += 2 * table_size
         self.encoded_positions = ti.field(dtype=ti.f32, shape=(BATCH_SIZE, self.n_features), needs_grad=True)
@@ -205,8 +212,10 @@ class MultiResHashEncoding:
                 self.encoded_positions[i, l * 2 + 1] = c.y
 
     def update(self, lr):
-        for g in self.grids:
-            ti_update_weights(g, g.grad, lr)
+        for i in range(len(self.grids)):
+            g = self.grids[i]
+            g_2nd_moment = self.grids_2nd_moment[i]
+            ti_update_weights(g, g.grad, g_2nd_moment, lr, 1e-15)
 
 torch_device = torch.device("cuda:0")
 
@@ -293,7 +302,7 @@ class MLP(nn.Module):
             self.grid_encoding.update(lr)
 
     def forward(self, x):
-        return self.mlp(x)
+        return torch.clamp(self.mlp(x), min=0.0, max=1.0)
 
 input_positions = torch.Tensor(BATCH_SIZE, 2).to(torch_device)
 output_colors = torch.Tensor(BATCH_SIZE, 3).to(torch_device)
@@ -356,7 +365,7 @@ window = ti.ui.Window("test", (width_scaled, height_scaled))
 canvas = window.get_canvas()
 gui = window.get_gui()
 
-writer = SummaryWriter()
+# writer = SummaryWriter()
 
 loss_smooth_0 = 0.0
 loss_smooth_1 = 0.0
@@ -383,7 +392,7 @@ while window.running:
 
     optimizer.zero_grad()
 
-    writer.add_scalar('Loss/train', loss.item(), iter)
+    # writer.add_scalar('Loss/train', loss.item(), iter)
 
     if iter % 25 == 0:
         i = 0
