@@ -339,7 +339,7 @@ def fill_batch_train(input_positions : ti.types.ndarray(element_dim=1),
         uv = base + input_positions[i] * window
         input_positions[i] = uv
         iuv = ti.cast(ti.floor(uv * ti.Vector([width, height])), ti.i32)
-        output_colors[i] = srgb_to_linear(img[iuv])
+        output_colors[i] = img[iuv] # srgb_to_linear(img[iuv])
 
 width_scaled = width // 4
 height_scaled = height // 4
@@ -359,7 +359,8 @@ def paint_batch_test(base : ti.i32, output : ti.types.ndarray(element_dim=1)):
     for i in range(BATCH_SIZE):
         ii = i + base
         iuv = ti.Vector([ii % width_scaled, ii // width_scaled])
-        rendered[iuv] = linear_to_srgb(ti.Vector([output[i].r, output[i].g, output[i].b, 1.0]))
+        c = ti.Vector([output[i].r, output[i].g, output[i].b, 1.0])
+        rendered[iuv] = c # linear_to_srgb(c)
 
 window = ti.ui.Window("test", (width_scaled, height_scaled))
 canvas = window.get_canvas()
