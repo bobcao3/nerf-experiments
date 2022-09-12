@@ -14,7 +14,7 @@ from stannum import Tin
 
 ti.init(arch=ti.cuda, device_memory_GB=2)
 
-learning_rate = 1e-2
+learning_rate = 5e-3
 n_iters = 10000
 
 np_img = ti.tools.imread("test.jpg").astype(np.single) / 255.0
@@ -40,9 +40,10 @@ def ti_update_weights(weight : ti.template(), grad : ti.template(), lr : ti.f32)
 def ti_update_weights(weight : ti.template(), grad : ti.template(), grad_2nd_moments : ti.template(), lr : ti.f32, eps : ti.f32):
     for I in ti.grouped(weight):
         g = grad[I]
-        g2 = grad_2nd_moments[I] + g * g
-        grad_2nd_moments[I] = g2
-        weight[I] -= lr * g / (ti.sqrt(g2) + eps)
+        if any(g != 0.0):
+            g2 = grad_2nd_moments[I] + g * g
+            grad_2nd_moments[I] = g2
+            weight[I] -= lr * g / (ti.sqrt(g2) + eps)
 
 @ti.data_oriented
 class FrequencyEncoding:
@@ -133,8 +134,8 @@ class MultiResGridEncoding:
                 c0 = c00 * (1.0 - fuv[0]) + c10 * fuv[0]
                 c1 = c01 * (1.0 - fuv[0]) + c11 * fuv[0]
                 c = c0 * (1.0 - fuv[1]) + c1 * fuv[1]
-                self.encoded_positions[i, l * 4 + 0] = c.x
-                self.encoded_positions[i, l * 4 + 1] = c.y
+                self.encoded_positions[i, l * 2 + 0] = c.x
+                self.encoded_positions[i, l * 2 + 1] = c.y
 
     def update(self, lr):
         for g in self.grids:
@@ -151,7 +152,7 @@ class MultiResHashEncoding:
         self.N_min = 16
         self.n_tables = 16
         self.b = np.exp((np.log(self.N_max) - np.log(self.N_min)) / (self.n_tables - 1))
-        self.max_table_size = (2 << 15)
+        self.max_table_size = (2 << 16)
 
         print("n_tables", self.n_tables)
         self.table_sizes = []
@@ -310,9 +311,9 @@ output_colors = torch.Tensor(BATCH_SIZE, 3).to(torch_device)
 model = MLP(encoding="instant_ngp")
 # model.fuse()
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, betas=(0.9, 0.99), eps=1e-15, weight_decay=1e-6)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.99), eps=1e-15, weight_decay=1e-6)
 # optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
-lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.33)
+lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.7)
 scaler = torch.cuda.amp.GradScaler()
 loss_fn = torch.nn.MSELoss().to(torch_device)
 
@@ -341,18 +342,18 @@ def fill_batch_train(input_positions : ti.types.ndarray(element_dim=1),
         iuv = ti.cast(ti.floor(uv * ti.Vector([width, height])), ti.i32)
         output_colors[i] = img[iuv] # srgb_to_linear(img[iuv])
 
-width_scaled = width // 4
-height_scaled = height // 4
+width_scaled = width // 5
+height_scaled = height // 5
 
 rendered = ti.Vector.field(4, dtype=ti.f32, shape=(width_scaled, height_scaled))
 
 @ti.kernel
-def fill_batch_test(base : ti.i32, input_positions : ti.types.ndarray(element_dim=1)):
+def fill_batch_test(base : ti.i32, input_positions : ti.types.ndarray(element_dim=1), scale : ti.f32, offset : ti.types.vector(2, ti.f32)):
     for i in range(BATCH_SIZE):
         ii = i + base
         iuv = ti.Vector([ii % width_scaled, ii // width_scaled])
-        uv = ti.cast(iuv, ti.f32)
-        input_positions[i] = uv / ti.Vector([width_scaled, height_scaled])
+        uv = ti.cast(iuv, ti.f32) / ti.Vector([width_scaled, height_scaled])
+        input_positions[i] = uv / scale + offset
 
 @ti.kernel
 def paint_batch_test(base : ti.i32, output : ti.types.ndarray(element_dim=1)):
@@ -376,6 +377,9 @@ soboleng = torch.quasirandom.SobolEngine(dimension=2)
 window.show()
 model.train()
 
+viewer_base = ti.Vector([0.0, 0.0])
+viewer_scale = 1.0
+
 iter = 0
 while window.running:
     input_positions = soboleng.draw(BATCH_SIZE).to(torch_device).requires_grad_(True)
@@ -383,13 +387,15 @@ while window.running:
     
     with torch.cuda.amp.autocast():
         pred = model(input_positions)
-        loss = loss_fn(pred, output_colors)
+        loss = loss_fn(pred, output_colors) * 1e4
 
-    scaler.scale(loss).backward()
-    scaler.step(optimizer)
-    scaler.update()
+    # scaler.scale(loss).backward()
+    # scaler.step(optimizer)
+    # scaler.update()
+    loss.backward()
+    optimizer.step()
 
-    model.update_ti_modules(lr = learning_rate)
+    model.update_ti_modules(lr = lr_scheduler.get_last_lr()[-1])
 
     optimizer.zero_grad()
 
@@ -399,29 +405,26 @@ while window.running:
         i = 0
         model.eval()
         while i < (width_scaled * height_scaled):
-            fill_batch_test(i, input_positions)
+            fill_batch_test(i, input_positions, viewer_scale, viewer_base)
             pred = model(input_positions)
             paint_batch_test(i, pred)
             i += BATCH_SIZE
         model.train()
     
     loss_smooth_0 = loss_smooth_0 * 0.9 + loss.item() * 0.1
-    loss_smooth_1 = max(loss_smooth_0, loss_smooth_1 * 0.999 + loss.item() * 0.001)
     
-    # if iter % 5000 == 5000 - 1:
-    #     lr_scheduler.step()
-    
-    if iter % 5 == 0:
+    if iter % 5 == 4:
         learning_rate = 10.0 ** gui.slider_float("learning_rate (log)", np.log10(learning_rate), -10.0, 1.0)
-        for g in optimizer.param_groups:
-            g['lr'] = learning_rate
         canvas.set_image(rendered)
         refine = gui.checkbox("refine", refine)
         gui.text(f"Iteration {iter}, exp_lr={lr_scheduler.get_last_lr()[-1]:.2e}")
-        gui.text(f"loss smooth 0 = {loss_smooth_0}")
-        gui.text(f"loss smooth 1 = {loss_smooth_1}")
-        if iter % 5000 == 0:
+        gui.text(f"loss smooth = {loss_smooth_0}")
+        viewer_scale = gui.slider_float("viewer_scale", viewer_scale, 1.0, 8.0)
+        viewer_base[0] = gui.slider_float("viewer_base_x", viewer_base[0], 0.0, 1.0)
+        viewer_base[1] = gui.slider_float("viewer_base_y", viewer_base[1], 0.0, 1.0)
+        if iter % 1000 == 999:
             window.save_image(f"{iter:06d}.png")
+            lr_scheduler.step()
         window.show()
 
     iter += 1
