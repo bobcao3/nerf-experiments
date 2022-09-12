@@ -195,6 +195,8 @@ def l1_loss(output: ti.template(), target: ti.template()):
 window = ti.ui.Window("test", (width_scaled, height_scaled))
 canvas = window.get_canvas()
 
+writer = SummaryWriter()
+
 for iter in range(10000):
     fill_batch_train()
     
