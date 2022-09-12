@@ -5,3 +5,4 @@ nerf_synthetic/
 runs/
 .vscode
 __pycache__
+imgui.ini
