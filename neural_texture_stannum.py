@@ -14,7 +14,7 @@ from stannum import Tin
 
 ti.init(arch=ti.cuda, device_memory_GB=2)
 
-learning_rate = 5e-3
+learning_rate = 1e-3
 n_iters = 10000
 
 np_img = ti.tools.imread("test.jpg").astype(np.single) / 255.0
@@ -31,19 +31,28 @@ img.from_numpy(np_img)
 L = 8
 max_scale = 1
 
+beta1 = 0.9
+beta2 = 0.99
+
 @ti.kernel
 def ti_update_weights(weight : ti.template(), grad : ti.template(), lr : ti.f32):
     for I in ti.grouped(weight):
         weight[I] -= lr * grad[I]
 
 @ti.kernel
-def ti_update_weights(weight : ti.template(), grad : ti.template(), grad_2nd_moments : ti.template(), lr : ti.f32, eps : ti.f32):
+def ti_update_weights(weight : ti.template(),
+                      grad : ti.template(), grad_1st_moments : ti.template(), grad_2nd_moments : ti.template(),
+                      lr : ti.f32, eps : ti.f32):
     for I in ti.grouped(weight):
         g = grad[I]
         if any(g != 0.0):
-            g2 = grad_2nd_moments[I] + g * g
-            grad_2nd_moments[I] = g2
-            weight[I] -= lr * g / (ti.sqrt(g2) + eps)
+            m = beta1 * grad_1st_moments[I] + (1.0 - beta1) * g
+            v = beta2 * grad_2nd_moments[I] + (1.0 - beta2) * g * g
+            grad_1st_moments[I] = m
+            grad_2nd_moments[I] = v
+            m_hat = m / (1.0 - beta1)
+            v_hat = v / (1.0 - beta2)
+            weight[I] -= lr * m_hat / (ti.sqrt(v_hat) + eps)
 
 @ti.data_oriented
 class FrequencyEncoding:
@@ -146,6 +155,7 @@ class MultiResHashEncoding:
     def __init__(self) -> None:
         self.input_positions = ti.Vector.field(2, dtype=ti.f32, shape=(BATCH_SIZE), needs_grad=False)
         self.grids = []
+        self.grids_1st_moment = []
         self.grids_2nd_moment = []
 
         self.N_max = max(width, height) // 2
@@ -170,6 +180,7 @@ class MultiResHashEncoding:
                 table_size = (N_l + 1) * (N_l + 1)
             print(f"level {i} resolution: {N_l} n_entries: {table_size}")
             self.grids.append(ti.Vector.field(2, dtype=ti.f32, shape=(table_size), needs_grad=True))
+            self.grids_1st_moment.append(ti.Vector.field(2, dtype=ti.f32, shape=(table_size)))
             self.grids_2nd_moment.append(ti.Vector.field(2, dtype=ti.f32, shape=(table_size)))
             self.n_features += 2
             self.n_params += 2 * table_size
@@ -215,8 +226,9 @@ class MultiResHashEncoding:
     def update(self, lr):
         for i in range(len(self.grids)):
             g = self.grids[i]
+            g_1st_momemt = self.grids_1st_moment[i]
             g_2nd_moment = self.grids_2nd_moment[i]
-            ti_update_weights(g, g.grad, g_2nd_moment, lr, 1e-15)
+            ti_update_weights(g, g.grad, g_1st_momemt, g_2nd_moment, lr, 1e-15)
 
 torch_device = torch.device("cuda:0")
 
@@ -289,6 +301,7 @@ class MLP(nn.Module):
                 npars += input_size * hidden_size
             elif i == n_layers - 1:
                 layers.append(nn.Linear(hidden_size, output_size, bias=False))
+                layers.append(nn.Sigmoid())
                 npars += hidden_size * output_size
             else:
                 layers.append(nn.Linear(hidden_size, hidden_size, bias=False))
@@ -303,7 +316,7 @@ class MLP(nn.Module):
             self.grid_encoding.update(lr)
 
     def forward(self, x):
-        return torch.clamp(self.mlp(x), min=0.0, max=1.0)
+        return self.mlp(x)
 
 input_positions = torch.Tensor(BATCH_SIZE, 2).to(torch_device)
 output_colors = torch.Tensor(BATCH_SIZE, 3).to(torch_device)
@@ -311,9 +324,9 @@ output_colors = torch.Tensor(BATCH_SIZE, 3).to(torch_device)
 model = MLP(encoding="instant_ngp")
 # model.fuse()
 
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.99), eps=1e-15, weight_decay=1e-6)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(beta1, beta2), eps=1e-15, weight_decay=1e-6)
 # optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
-lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.7)
+lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.9)
 scaler = torch.cuda.amp.GradScaler()
 loss_fn = torch.nn.MSELoss().to(torch_device)
 
@@ -327,6 +340,8 @@ def srgb_to_linear(x):
 def linear_to_srgb(x):
     return x ** (1.0 / 2.2)
 
+snap_to_pixel = True
+
 @ti.kernel
 def fill_batch_train(input_positions : ti.types.ndarray(element_dim=1),
                      output_colors : ti.types.ndarray(element_dim=1),
@@ -338,8 +353,10 @@ def fill_batch_train(input_positions : ti.types.ndarray(element_dim=1),
         base = ti.Vector([ti.random(), ti.random()]) * (1.0 - window)
     for i in range(BATCH_SIZE):
         uv = base + input_positions[i] * window
-        input_positions[i] = uv
         iuv = ti.cast(ti.floor(uv * ti.Vector([width, height])), ti.i32)
+        if ti.static(snap_to_pixel):
+            uv = ti.cast(iuv, ti.f32) / ti.Vector([width, height])
+        input_positions[i] = uv
         output_colors[i] = img[iuv] # srgb_to_linear(img[iuv])
 
 width_scaled = width // 5
@@ -395,7 +412,7 @@ while window.running:
     loss.backward()
     optimizer.step()
 
-    model.update_ti_modules(lr = lr_scheduler.get_last_lr()[-1])
+    model.update_ti_modules(lr = learning_rate)
 
     optimizer.zero_grad()
 
