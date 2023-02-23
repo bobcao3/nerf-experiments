@@ -35,7 +35,7 @@ def volume_interp(
     for i, j in sample_positions:
         if j < num_samples[i]: 
             dir = input[i][3:6]
-            pos = sample_positions[i, j] * GRID_SIZE
+            pos = (sample_positions[i, j] / 3.0 + 0.5) * (GRID_SIZE - 1)
             ipos = ti.Vector([0, 0, 0])
             if ti.static(NEAREST_NEIGHBOR):
                 ipos = ti.cast(ti.round(pos), ti.i32)
@@ -46,12 +46,12 @@ def volume_interp(
 
             sigma = parameters_sigma[ipos]
             sh_coeffs_r = parameters_rgb[ipos, 0]
-            sh_coeffs_g = parameters_rgb[ipos, 1]
-            sh_coeffs_b = parameters_rgb[ipos, 2]
-            r = l2_sh(sh_coeffs_r, dir)
-            g = l2_sh(sh_coeffs_g, dir)
-            b = l2_sh(sh_coeffs_b, dir)
-            output[i, j] = ti.max(0.0, ti.Vector([r, g, b, sigma]))
+            # sh_coeffs_g = parameters_rgb[ipos, 1]
+            # sh_coeffs_b = parameters_rgb[ipos, 2]
+            # r = l2_sh(sh_coeffs_r, dir)
+            # g = l2_sh(sh_coeffs_g, dir)
+            # b = l2_sh(sh_coeffs_b, dir)
+            output[i, j] = ti.Vector([sh_coeffs_r[0], sh_coeffs_r[1], sh_coeffs_r[2], sigma])
 
 @ti.kernel
 def generate_samples(
@@ -68,23 +68,25 @@ def generate_samples(
             num_samples[i] = ti.cast(ti.min((far - near) * 32.0, 256.0), ti.i32)
             for j in range(num_samples[i]):
                 t = near + (far - near) * (j + 0.5) / num_samples[i]
-                output_pos[i, j] = ((ray_origin + ray_dir * t) / 1.5) * 0.5 + 0.5
+                output_pos[i, j] = ray_origin + ray_dir * t
                 dists[i, j] = (far - near) / num_samples[i]
         else:
             num_samples[i] = 0
 
 @ti.kernel
-def volume_render(samples_output: ti.template(), output: ti.template(), num_samples: ti.template(), dists: ti.template()):
+def volume_render(samples_output: ti.template(), output: ti.template(), alpha_T : ti.template(), num_samples: ti.template(), dists: ti.template()):
     for i in output:
-        color = ti.Vector([1.0, 1.0, 1.0, 1.0])
-        alpha_cumprod = 1.0
-        for j in range(num_samples[i]):
+        # color = ti.Vector([1.0, 1.0, 1.0, 1.0])
+        n_samples = ti.cast(num_samples[i], ti.i32)
+        for j in range(256):
             sample = samples_output[i, j]
-            alpha = 1.0 - ti.exp(sample.a * dists[i, j])
-            alpha_cumprod = alpha_cumprod * (1.0 - alpha)
-            weight = alpha * alpha_cumprod
-            color += weight * color
-        output[i] = ti.Vector([color.r, color.g, color.b, 1.0 - color.a])
+            alpha = 1.0 - ti.exp(-ti.max(sample.a, 0.0) * dists[i, j])
+            T_ = 1.0
+            if j > 0:
+                T_ = alpha_T[i, j - 1]
+            w = alpha * T_
+            alpha_T[i, j] = (1.0 - alpha) * T_
+            output[i] += ti.Vector([sample.r, sample.g, sample.b, 1.0]) * w
 
 cache = {}
 def get_ti_field(name, s, needs_grad=False):
@@ -117,16 +119,22 @@ class VolumeRenderer(torch.autograd.Function):
         input.from_torch(_input)
         # Internal fields
         output_positions = get_ti_field('output_positions', (_input.shape[0], 256, 3))
+        output_positions.fill(0.0)
         num_samples = get_ti_field('num_samples', (_input.shape[0],))
+        num_samples.fill(0)
         sample_output = get_ti_field('sample_output', (_input.shape[0], 256, 4), needs_grad=True)
+        sample_output.fill(0.0)
         dists = get_ti_field('dists', (_input.shape[0], 256, 1))
+        dists.fill(0.0)
+        alpha_T = get_ti_field('alpha_T', (_input.shape[0], 256, 1), needs_grad=True)
+        alpha_T.fill(0.0)
         # Output fields
         output = get_ti_field('output', (_input.shape[0], 4), needs_grad=True)
         # Run kernels
         generate_samples(input, output_positions, num_samples, dists)
         volume_interp(parameters_sigma, parameters_rgb, output_positions, input, sample_output, num_samples)
-        volume_render(sample_output, output, num_samples, dists)
-        return output.to_torch()
+        volume_render(sample_output, output, alpha_T, num_samples, dists)
+        return output.to_torch(_input.device)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -143,22 +151,31 @@ class VolumeRenderer(torch.autograd.Function):
         num_samples = get_ti_field('num_samples', (_input.shape[0],))
         sample_output = get_ti_field('sample_output', (_input.shape[0], 256, 4), needs_grad=True)
         dists = get_ti_field('dists', (_input.shape[0], 256, 1))
+        alpha_T = get_ti_field('alpha_T', (_input.shape[0], 256 + 1, 1), needs_grad=True)
         # Output fields
         output = get_ti_field('output', (_input.shape[0], 4), needs_grad=True)
         output.grad.from_torch(grad_output)
-        print("output", output.grad)
+        # Clean
+        sample_output.grad.fill(0)
+        alpha_T.grad.fill(0)
+        parameters_sigma.grad.fill(0)
+        parameters_rgb.grad.fill(0)
         # Run grad kernels
-        volume_render.grad(sample_output, output, num_samples, dists)
-        print("sample_output", sample_output.grad)
+        ti.sync()
+        torch.cuda.synchronize()
+        ti.sync()
+        volume_render.grad(sample_output, output, alpha_T, num_samples, dists)
         volume_interp.grad(parameters_sigma, parameters_rgb, output_positions, input, sample_output, num_samples)
-        print("parameters_sigma", parameters_sigma.grad)
-        return parameters_sigma.grad.to_torch(), parameters_rgb.grad.to_torch(), None
+        # print("output", output.grad.to_torch(_input.device).max())
+        # print("sample_output", sample_output.grad.to_torch(_input.device).max())
+        # print("parameters_sigma", parameters_sigma.grad.to_torch(_input.device).max())
+        return parameters_sigma.grad.to_torch(_input.device), parameters_rgb.grad.to_torch(_input.device), None
     
 class VolumeRendererModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
-        self.w_sigma = torch.nn.Parameter(torch.randn(GRID_SIZE, GRID_SIZE, GRID_SIZE, dtype=torch.float32), requires_grad=True)
-        self.w_rgb = torch.nn.Parameter(torch.randn(GRID_SIZE, GRID_SIZE, GRID_SIZE, 3, 9, dtype=torch.float32), requires_grad=True)
+        self.w_sigma = torch.nn.Parameter(torch.rand(GRID_SIZE, GRID_SIZE, GRID_SIZE, dtype=torch.float32) * 1e-3, requires_grad=True)
+        self.w_rgb = torch.nn.Parameter(torch.randn(GRID_SIZE, GRID_SIZE, GRID_SIZE, 3, 9, dtype=torch.float32) * 1e-3, requires_grad=True)
     
     def forward(self, input):
         return VolumeRenderer.apply(self.w_sigma, self.w_rgb, input)

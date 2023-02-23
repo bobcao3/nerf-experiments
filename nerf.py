@@ -12,9 +12,9 @@ from torch.nn.modules import module
 from torch.utils.tensorboard import SummaryWriter
 from voxel_nerf import VolumeRendererModule
 
-# ti.init(arch=ti.cuda)
-# torch.backends.cuda.matmul.allow_tf32 = True
-ti.init(arch=ti.vulkan)
+ti.init(arch=ti.cuda)
+torch.backends.cuda.matmul.allow_tf32 = True
+# ti.init(arch=ti.vulkan)
 
 class NerfLoss(nn.Module):
   def __init__(self):
@@ -115,8 +115,8 @@ def generate_data(desc, i):
 desc = load_desc_from_json(set_name + "/" + scene_name + "/transforms_train.json")
 desc_test = load_desc_from_json(set_name + "/" + scene_name + "/transforms_test.json")
 
-# device = "cuda"
-device = 'cpu'
+device = "cuda"
+# device = 'cpu'
 
 # model = DeferredNerf(num_layers=mlp_layers, num_hidden=mlp_hidden).to(device)
 model = VolumeRendererModule().to(device)
