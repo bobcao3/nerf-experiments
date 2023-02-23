@@ -9,18 +9,24 @@ import json
 import math
 import torch
 from torch.nn.modules import module
-import torchvision
 from torch.utils.tensorboard import SummaryWriter
-from torchvision import datasets, transforms
-from dense_grid import DeferredNerf
+from voxel_nerf import VolumeRendererModule
 
-ti.init(arch=ti.cuda)
-torch.backends.cuda.matmul.allow_tf32 = True
+# ti.init(arch=ti.cuda)
+# torch.backends.cuda.matmul.allow_tf32 = True
+ti.init(arch=ti.vulkan)
 
-def loss_fn(X, Y):
-  L = (X - Y) * (X - Y)
-  return L.sum()
-  # return F.mse_loss(X, Y)
+class NerfLoss(nn.Module):
+  def __init__(self):
+    super(NerfLoss, self).__init__()
+
+  def forward(self, X, Y):
+    Xrgb = X[:, :3]
+    Xalpha = X[:, 3]
+    L = (Xrgb - Y) ** 2
+    o = Xalpha + 1e-10
+    loss = L.sum()# + 1e-3 * (-o * torch.log(o)).sum()
+    return loss
 
 set_name = "nerf_synthetic"
 scene_name = "lego"
@@ -33,7 +39,7 @@ mlp_hidden = 64
 learning_rate = 1e-2
 iterations = 300000
 batch_size = 4096
-optimizer_fn = torch.optim.Adam
+optimizer_fn = torch.optim.RMSprop
 
 def load_desc_from_json(filename):
   f = open(filename, "r")
@@ -69,9 +75,7 @@ def image_to_data(
   output : ti.template(),
   fov_w : ti.f32,
   fov_h : ti.f32,
-  world_pos_x : ti.f32,
-  world_pos_y : ti.f32,
-  world_pos_z : ti.f32):
+  world_pos : ti.types.vector(3, ti.f32)):
   for i,j in scaled_image:
     scaled_image[i, j] = ti.Vector([0.0, 0.0, 0.0, 0.0])
   for i,j in input_img:
@@ -88,7 +92,7 @@ def image_to_data(
       dot(camera_mtx[0], view_dir),
       dot(camera_mtx[1], view_dir),
       dot(camera_mtx[2], view_dir)])
-    input[ti.cast(i * image_h + j, dtype=ti.i32)] = ti.Vector([world_pos_x, world_pos_y, world_pos_z, world_dir.x, world_dir.y, world_dir.z])
+    input[ti.cast(i * image_h + j, dtype=ti.i32)] = ti.Vector([world_pos.x, world_pos.y, world_pos.z, world_dir.x, world_dir.y, world_dir.z])
     output[ti.cast(i * image_h + j, dtype=ti.i32)] = ti.Vector([scaled_image[i, j].x, scaled_image[i, j].y, scaled_image[i, j].z])
 
 input_image = ti.Vector.field((4), dtype=ti.f32, shape=(int(image_w) * downscale, int(image_h) * downscale))
@@ -100,24 +104,27 @@ def generate_data(desc, i):
   img = desc["frames"][i]
   file_name = set_name + "/" + scene_name + "/" + img["file_path"] + ".png"
   # print("loading", file_name)
-  npimg = ti.imread(file_name)
+  npimg = ti.tools.imread(file_name)
   input_image.from_numpy(npimg)
   mtx = np.array(img["transform_matrix"])
-  camera_mtx.from_numpy(mtx[:3,:3])
+  camera_mtx.from_numpy(mtx[:3,:3].astype(np.float32))
   ray_o = mtx[:3,-1]
   ti.sync()
-  image_to_data(input_image, scaled_image, input_data, output_data, float(desc["camera_angle_x"]), float(desc["camera_angle_x"]), ray_o[0], ray_o[1], ray_o[2])
+  image_to_data(input_image, scaled_image, input_data, output_data, float(desc["camera_angle_x"]), float(desc["camera_angle_x"]), ti.Vector(ray_o, dt=ti.f32))
 
 desc = load_desc_from_json(set_name + "/" + scene_name + "/transforms_train.json")
 desc_test = load_desc_from_json(set_name + "/" + scene_name + "/transforms_test.json")
 
-device = "cuda"
+# device = "cuda"
+device = 'cpu'
 
-model = DeferredNerf(num_layers=mlp_layers, num_hidden=mlp_hidden).to(device)
+# model = DeferredNerf(num_layers=mlp_layers, num_hidden=mlp_hidden).to(device)
+model = VolumeRendererModule().to(device)
+lossfn = NerfLoss().to(device)
 print(model)
 
 optimizer = optimizer_fn(model.parameters(), lr=learning_rate)
-scaler = torch.cuda.amp.GradScaler()
+# scaler = torch.cuda.amp.GradScaler()
 
 # train loop
 iter = 0
@@ -156,9 +163,8 @@ for iter in range(iterations):
   Ybatch = Y[indices[b]]
 
   with torch.cuda.amp.autocast():
-    pred, diffuse = model(Xbatch)
-    loss = loss_fn(pred, Ybatch) * 0.1
-    loss += loss_fn(diffuse, Ybatch)
+    pred = model(Xbatch)
+    loss = lossfn(pred, Ybatch)
   
   loss.backward()
   optimizer.step()
@@ -185,15 +191,15 @@ for iter in range(iterations):
         img_pred = []
 
         for b in range(len(Xbatch)):
-          with torch.cuda.amp.autocast():
-            pred, _ = model(Xbatch[b])
-            loss = loss_fn(pred, Ybatch[b])
-            img_pred.append(pred)
-            test_loss += loss.item()
+          # with torch.cuda.amp.autocast():
+          pred = model(Xbatch[b])
+          loss = lossfn(pred, Ybatch[b])
+          img_pred.append(pred)
+          test_loss += loss.item()
 
         img_pred = torch.vstack(img_pred)
         img_pred = img_pred.cpu().detach().numpy()
-        img_pred = img_pred.reshape((int(image_w), int(image_h), 3))
+        img_pred = img_pred.reshape((int(image_w), int(image_h), 4))
 
         if i == test_indicies[0]:
           ti.imwrite(img_pred, "output_iter" + str(iter) + "_r" + str(i) + ".png")
