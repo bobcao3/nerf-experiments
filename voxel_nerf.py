@@ -3,7 +3,7 @@ import taichi as ti
 import numpy as np
 from math_utils import ray_aabb_intersection
 
-ti.init(arch=ti.vulkan, device_memory_GB=8)
+ti.init(arch=ti.cuda, device_memory_GB=6)
 
 data_t = ti.f32
 data_vec3_t = ti.types.vector(3, data_t)
@@ -21,9 +21,10 @@ image_w = 800 // downscale
 image_h = 800 // downscale
 num_pixels = image_w * image_h
 
-learning_rate_sigma = 0.1
+learning_rate_sigma = 0.3
 learning_rate_rgb = 0.01
-iterations = 300000
+
+max_samples = 256
 
 def load_desc_from_json(filename):
   f = open(filename, "r")
@@ -138,9 +139,10 @@ def generate_samples(
         dir = ray_dirs[i].normalized()
         isect, near, far = ray_aabb_intersection(ti.Vector([-1.5, -1.5, -1.5]), ti.Vector([1.5, 1.5, 1.5]), o, dir)
         if isect:
-            num_samples[i] = ti.cast(ti.min((far - near) * 32.0, 256.0), ti.i32)
+            num_samples[i] = ti.cast(ti.min((far - near) * 128.0, max_samples), ti.i32)
+            jitter = ti.random()
             for j in range(num_samples[i]):
-                t = near + (far - near) * (j + 0.5) / num_samples[i]
+                t = near + (far - near) * (j + jitter) / num_samples[i]
                 sample_pos[i, j] = o + dir * t
                 dists[i, j] = (far - near) / num_samples[i]
         else:
@@ -167,8 +169,8 @@ def nerf_loss_fn(output: ti.template(), target: ti.template(), loss: ti.template
         sq_diff = (output[i].rgb - target[i]) ** 2.0
         o = output[i].a + eps
         # encourage opacity to be either 0 or 1 to avoid floater
-        loss[None] += 1e-3 * (-o * ti.log(o))
-        loss[None] += sq_diff.x + sq_diff.y + sq_diff.z
+        scale = 1.0 / output.shape[0]
+        loss[None] += (1e-3 * (-o * ti.log(o)) + sq_diff.x + sq_diff.y + sq_diff.z) * scale
 
 @ti.kernel
 def randomize_parameters(parameters: ti.template(), scale: ti.f32, mean: ti.f32):
@@ -197,14 +199,14 @@ desc_test = load_desc_from_json(set_name + "/" + scene_name + "/transforms_test.
 ray_dir = ti.Vector.field(3, data_t, (num_pixels,))
 ray_o = ti.Vector.field(3, data_t, (num_pixels,))
 target_data = ti.Vector.field(3, data_t, (num_pixels,))
-sample_pos = ti.Vector.field(3, dtype=data_t, shape=(num_pixels, 256))
+sample_pos = ti.Vector.field(3, dtype=data_t, shape=(num_pixels, max_samples))
 num_samples = ti.field(dtype=ti.i32, shape=num_pixels)
-dists = ti.field(dtype=data_t, shape=(num_pixels, 256))
+dists = ti.field(dtype=data_t, shape=(num_pixels, max_samples))
 
 parameters_sigma = ti.field(dtype=data_t, shape=(GRID_SIZE, GRID_SIZE, GRID_SIZE), needs_grad=True)
 parameters_rgb = ti.Vector.field(9, dtype=data_t, shape=(GRID_SIZE, GRID_SIZE, GRID_SIZE, 3), needs_grad=True)
-alpha_T = ti.field(dtype=data_t, shape=(num_pixels, 256), needs_grad=True)
-sample_output = ti.Vector.field(4, dtype=data_t, shape=(num_pixels, 256), needs_grad=True)
+alpha_T = ti.field(dtype=data_t, shape=(num_pixels, max_samples), needs_grad=True)
+sample_output = ti.Vector.field(4, dtype=data_t, shape=(num_pixels, max_samples), needs_grad=True)
 output = ti.Vector.field(4, dtype=data_t, shape=num_pixels, needs_grad=True)
 loss = ti.field(dtype=data_t, shape=(), needs_grad=True)
 
@@ -293,6 +295,7 @@ for iter in range(len(indices) * 10):
     ray_o.from_numpy(Xbatch_o)
     ray_dir.from_numpy(Xbatch_dir)
     target_data.from_numpy(Ybatch)
+    ti.sync()
 
     generate_samples(ray_o, ray_dir, sample_pos, num_samples, dists)        
     with ti.ad.Tape(loss):
@@ -308,7 +311,7 @@ for iter in range(len(indices) * 10):
     print(f"iter={iter} training loss={loss[None]}")
 
     # Testing
-    if iter % 100 == 0:
+    if iter % 100 == 99:
         print("Testing epoch", epoch)
         average_test_loss = 0.0
         for i in test_indices:
