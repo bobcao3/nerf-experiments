@@ -67,7 +67,7 @@ def image_to_data(
     world_dir = camera_mtx @ view_dir
     ray_dir[ti.cast(i * image_h + j, dtype=ti.i32)] = world_dir
     ray_o[ti.cast(i * image_h + j, dtype=ti.i32)] = origin
-    output[ti.cast(i * image_h + j, dtype=ti.i32)] = ti.Vector([scaled_image[i, j].x, scaled_image[i, j].y, scaled_image[i, j].z])
+    output[ti.cast(i * image_h + j, dtype=ti.i32)] = scaled_image[i, j]
 
 @ti.func
 def l2_sh(coeffs, pos):
@@ -166,10 +166,12 @@ def volume_render(samples_output: ti.template(), output: ti.template(), alpha_T 
 @ti.kernel
 def nerf_loss_fn(output: ti.template(), target: ti.template(), loss: ti.template()):
     for i in output:
-        sq_diff = (output[i].rgb - target[i]) ** 2.0
-        o = output[i].a + eps
+        sq_diff = (output[i] - target[i]) ** 2.0
+        # o = output[i].a + eps
         # encourage opacity to be either 0 or 1 to avoid floater
-        loss[i] = (1e-3 * (-o * ti.log(o)) + sq_diff.x + sq_diff.y + sq_diff.z)
+        # loss[i] = (1e-3 * (-o * ti.log(o)) + sq_diff.x + sq_diff.y + sq_diff.z)
+        loss[i] = sq_diff.dot(data_vec4_t(1.0))
+
 
 sigma_tv = 1e-5
 rgb_tv = 1e-3
@@ -235,7 +237,7 @@ desc_test = load_desc_from_json(set_name + "/" + scene_name + "/transforms_test.
 
 ray_dir = ti.Vector.field(3, data_t, (num_pixels,))
 ray_o = ti.Vector.field(3, data_t, (num_pixels,))
-target_data = ti.Vector.field(3, data_t, (num_pixels,))
+target_data = ti.Vector.field(4, data_t, (num_pixels,))
 sample_pos = ti.Vector.field(3, dtype=data_t, shape=(num_pixels, max_samples))
 num_samples = ti.field(dtype=ti.i32, shape=num_pixels)
 dists = ti.field(dtype=data_t, shape=(num_pixels, max_samples))
