@@ -12,9 +12,9 @@ from torch.nn.modules import module
 from torch.utils.tensorboard import SummaryWriter
 from voxel_nerf import VolumeRendererModule
 
-ti.init(arch=ti.cuda)
+# ti.init(arch=ti.cuda)
 torch.backends.cuda.matmul.allow_tf32 = True
-# ti.init(arch=ti.vulkan)
+ti.init(arch=ti.vulkan)
 
 class NerfLoss(nn.Module):
   def __init__(self):
