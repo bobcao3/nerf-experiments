@@ -3,7 +3,7 @@ import taichi as ti
 import numpy as np
 from math_utils import ray_aabb_intersection
 
-ti.init(arch=ti.cuda, device_memory_GB=6)
+ti.init(arch=ti.cuda, device_memory_GB=12)
 
 data_t = ti.f32
 data_vec3_t = ti.types.vector(3, data_t)
@@ -12,16 +12,16 @@ sh_vec_t = ti.types.vector(9, data_t) # sigma + 3 * (9 SH coeffs)
 pos_vec_t = ti.types.vector(3, data_t) # XYZ
 output_vec_t = ti.types.vector(4, data_t) # RGB, alpha
 
-GRID_SIZE = 128
+GRID_SIZE = 256
 
 set_name = "nerf_synthetic"
-scene_name = "lego"
+scene_name = "drums"
 downscale = 2
 image_w = 800 // downscale
 image_h = 800 // downscale
 num_pixels = image_w * image_h
 
-learning_rate_sigma = 0.3
+learning_rate_sigma = 0.1
 learning_rate_rgb = 0.01
 
 max_samples = 256
@@ -169,8 +169,45 @@ def nerf_loss_fn(output: ti.template(), target: ti.template(), loss: ti.template
         sq_diff = (output[i].rgb - target[i]) ** 2.0
         o = output[i].a + eps
         # encourage opacity to be either 0 or 1 to avoid floater
-        scale = 1.0 / output.shape[0]
-        loss[None] += (1e-3 * (-o * ti.log(o)) + sq_diff.x + sq_diff.y + sq_diff.z) * scale
+        loss[i] = (1e-3 * (-o * ti.log(o)) + sq_diff.x + sq_diff.y + sq_diff.z)
+
+sigma_tv = 1e-5
+rgb_tv = 1e-3
+
+@ti.kernel
+def generate_tv_loss_index(sampling_index: ti.template()):
+    for i in sampling_index:
+        rand_loc = ti.Vector([ti.random(), ti.random(), ti.random()]) * (GRID_SIZE - 1)
+        rand_iloc = ti.cast(ti.floor(rand_loc), ti.i32)
+        sampling_index[i] = rand_iloc
+
+@ti.kernel
+def tv_loss_fn(sigma: ti.template(), rgb: ti.template(), sampling_index: ti.template(), loss: ti.template()):
+    for i in sampling_index:
+        I = sampling_index[i]
+        mean = 0.0
+        sq_mean = 0.0
+        for offset in ti.static(ti.ndrange(3, 3, 3)):
+            Ioffset = I + offset - ti.Vector([1, 1, 1])
+            mean += sigma[Ioffset]
+            sq_mean += sigma[Ioffset] ** 2.0
+        loss[i] += (sq_mean / 27.0 - (mean / 27.0) ** 2.0) * sigma_tv
+    for i, channel in ti.ndrange(256, 3):
+        I = sampling_index[i]
+        mean = sh_vec_t(0.0)
+        sq_mean = sh_vec_t(0.0)
+        for offset in ti.static(ti.ndrange(3, 3, 3)):
+            Ioffset = I + offset - ti.Vector([1, 1, 1])
+            mean += rgb[Ioffset, channel]
+            sq_mean += rgb[Ioffset, channel] ** 2.0
+        loss[i] += (sq_mean / 27.0 - (mean / 27.0) ** 2.0).dot(sh_vec_t(1.0)) / (3.0 * 9.0) * rgb_tv
+
+@ti.kernel
+def sum_loss(loss_pixels: ti.template(), loss_tv: ti.template(), loss_sum: ti.template()):
+    for i in loss_pixels:
+        loss_sum[None] += loss_pixels[i] / num_pixels
+    for i in loss_tv:
+        loss_sum[None] += loss_tv[i] / 256.0
 
 @ti.kernel
 def randomize_parameters(parameters: ti.template(), scale: ti.f32, mean: ti.f32):
@@ -203,11 +240,15 @@ sample_pos = ti.Vector.field(3, dtype=data_t, shape=(num_pixels, max_samples))
 num_samples = ti.field(dtype=ti.i32, shape=num_pixels)
 dists = ti.field(dtype=data_t, shape=(num_pixels, max_samples))
 
+sampling_index = ti.Vector.field(3, dtype=ti.i32, shape=(int(256), ))
+
 parameters_sigma = ti.field(dtype=data_t, shape=(GRID_SIZE, GRID_SIZE, GRID_SIZE), needs_grad=True)
 parameters_rgb = ti.Vector.field(9, dtype=data_t, shape=(GRID_SIZE, GRID_SIZE, GRID_SIZE, 3), needs_grad=True)
 alpha_T = ti.field(dtype=data_t, shape=(num_pixels, max_samples), needs_grad=True)
 sample_output = ti.Vector.field(4, dtype=data_t, shape=(num_pixels, max_samples), needs_grad=True)
 output = ti.Vector.field(4, dtype=data_t, shape=num_pixels, needs_grad=True)
+per_pixel_loss = ti.field(dtype=data_t, shape=num_pixels, needs_grad=True)
+tv_loss = ti.field(dtype=data_t, shape=256, needs_grad=True)
 loss = ti.field(dtype=data_t, shape=(), needs_grad=True)
 
 grad_1st_moments_sigma = ti.field(dtype=data_t, shape=(GRID_SIZE, GRID_SIZE, GRID_SIZE))
@@ -251,6 +292,8 @@ def reset():
     alpha_T.fill(0.0)
     sample_output.fill(0.0)
     output.fill(0.0)
+    per_pixel_loss.fill(0.0)
+    tv_loss.fill(0.0)
     loss[None] = 0.0
 
 def zero_grad():
@@ -259,6 +302,8 @@ def zero_grad():
     alpha_T.grad.fill(0.0)
     sample_output.grad.fill(0.0)
     output.grad.fill(0.0)
+    per_pixel_loss.grad.fill(0.0)
+    tv_loss.grad.fill(0.0)
 
 num_tests = 5
 test_indices = np.random.choice(len(desc_test["frames"]), size=(num_tests))
@@ -297,11 +342,15 @@ for iter in range(len(indices) * 10):
     target_data.from_numpy(Ybatch)
     ti.sync()
 
-    generate_samples(ray_o, ray_dir, sample_pos, num_samples, dists)        
+    generate_samples(ray_o, ray_dir, sample_pos, num_samples, dists)
+    generate_tv_loss_index(sampling_index)
+    ti.sync()
     with ti.ad.Tape(loss):
         volume_interp(parameters_sigma, parameters_rgb, sample_pos, ray_dir, num_samples, sample_output)
         volume_render(sample_output, output, alpha_T, num_samples, dists)
-        nerf_loss_fn(output, target_data, loss)
+        nerf_loss_fn(output, target_data, per_pixel_loss)
+        tv_loss_fn(parameters_sigma, parameters_rgb, sampling_index, tv_loss)
+        sum_loss(per_pixel_loss, tv_loss, loss)
     # print(f"epoch={epoch} iter={i} loss={loss[None]}")
     # print("output grad", output.grad.to_numpy().max())
     # print("sample_output grad", sample_output.grad.to_numpy().max())
@@ -320,7 +369,9 @@ for iter in range(len(indices) * 10):
             generate_samples(ray_o, ray_dir, sample_pos, num_samples, dists)        
             volume_interp(parameters_sigma, parameters_rgb, sample_pos, ray_dir, num_samples, sample_output)
             volume_render(sample_output, output, alpha_T, num_samples, dists)
-            nerf_loss_fn(output, target_data, loss)
+            nerf_loss_fn(output, target_data, per_pixel_loss)
+            # tv_loss_fn(parameters_sigma, parameters_rgb, sampling_index, tv_loss)
+            sum_loss(per_pixel_loss, tv_loss, loss)
             average_test_loss += loss[None]
             output_shaped = output.to_numpy().reshape((image_w, image_h, 4))
             ti.tools.imwrite(output_shaped, f"out/test_{i}_epoch_{epoch}.png")
